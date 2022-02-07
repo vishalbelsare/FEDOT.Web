@@ -90,13 +90,11 @@ def _init_composer_history_for_case(history_id, task, metric, dataset_name, time
     mock_dct = {}
 
     db_service = DBServiceSingleton()
-    history_path = None
+    history_path = Path(project_root(), 'data', history_id, f'{history_id}_{task}.json')
 
     if external_history is None:
         # run composer in real-time
-        history = run_composer(
-            task, metric, dataset_name, time, Path(project_root(), 'data', history_id, f'{history_id}_{task}.json')
-        )
+        history = run_composer(task, metric, dataset_name, time, history_path)
         history_obj = history.save()
     elif isinstance(external_history, dict):
         # init from dict
@@ -107,9 +105,6 @@ def _init_composer_history_for_case(history_id, task, metric, dataset_name, time
         history_path = Path(external_history)
         history = run_composer(task, metric, dataset_name, time, fitted_history_path=history_path)
         history_obj = history.save()
-
-    if history_path is None:
-        history_path = Path(f'{project_root()}/data/{history_id}/{history_id}_{task}.json')
 
     _save_history_to_path(history, history_path)
 
