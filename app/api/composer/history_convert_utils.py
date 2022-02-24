@@ -2,6 +2,7 @@ from copy import deepcopy
 from typing import Any, Dict
 
 import networkx as nx
+
 from fedot.core.optimisers.opt_history import OptHistory
 from matplotlib import pyplot as plt
 
@@ -46,9 +47,12 @@ def _process_operator(all_nodes, operator, individual, o_id, gen_id, prev_operat
             not in [n['tmp_operator_uid'] for n in all_nodes if n['type'] == 'evo_operator']:
         all_nodes.append(operator_node)
     else:
-        node_to_update = \
-            [n for n in all_nodes if n['type'] == 'evo_operator' and n['tmp_operator_uid'] == operator.uid][0]
-        node_to_update['tmp_parent_pipelines'].extend(operator_node['tmp_parent_pipelines'])
+        node_to_update = next(
+            (n for n in all_nodes if n['type'] == 'evo_operator' and n['tmp_operator_uid'] == operator.uid),
+            None
+        )
+        if node_to_update is not None:
+            node_to_update['tmp_parent_pipelines'].extend(operator_node['tmp_parent_pipelines'])
     return all_nodes
 
 
