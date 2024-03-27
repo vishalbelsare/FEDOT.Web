@@ -1,13 +1,18 @@
+import itertools
 import json
 import os
 from pathlib import Path
 from typing import Optional, Union
 
 from bson import json_util
-from fedot.core.optimisers.opt_history import OptHistory
+from fedot.core.pipelines.adapters import PipelineAdapter
+from golem.core.optimisers.opt_history_objects.individual import Individual
+from golem.core.optimisers.opt_history_objects.opt_history import OptHistory
 from fedot.core.pipelines.pipeline import Pipeline
+from fedot.core.pipelines.template import PipelineTemplate
 from fedot.preprocessing.structure import PipelineStructureExplorer
 from flask import current_app
+from golem.core.optimisers.opt_history_objects.parent_operator import ParentOperator
 
 from app.api.composer.service import run_composer
 from app.api.data.service import get_input_data
@@ -85,20 +90,70 @@ def _save_history_to_path(history: OptHistory, path: Path) -> None:
     path.write_text(history.save())
 
 
+def get_individual_from_history_by_uid(history: OptHistory, uid: str):
+    for generation_index in range(len(history.individuals)):
+        generation = history.individuals[generation_index]
+        individual: Individual
+        for individual in generation:
+            if individual.uid == uid:
+                return individual, generation_index
+
+
+def merge_histories(original_history: OptHistory, new_history: OptHistory, modificated_generation_index: int,
+                    original_uid: str):
+    gens = {}
+
+    mod_gen = modificated_generation_index
+    gen_shift = mod_gen + 1
+
+    for generation_index in range(len(new_history.individuals)):
+        if generation_index == 0:
+            continue
+        ind: Individual
+        for ind in new_history.individuals[generation_index]:
+            if ind.uid in gens:
+                pass
+            else:
+                object.__setattr__(ind, 'native_generation', generation_index + gen_shift)
+                gens[ind.uid] = generation_index + gen_shift
+
+    for generation_index in range(len(new_history.individuals)):
+        if generation_index + gen_shift >= len(original_history.individuals):
+            original_history.individuals.append(new_history.individuals[generation_index])
+            original_history.individuals[-1].generation_num = len(original_history.individuals) - 1
+        else:
+            original_history.individuals[generation_index + gen_shift].generation_num = generation_index + gen_shift
+            original_history.individuals[generation_index + gen_shift].extend(new_history.individuals[generation_index])
+
+    parent, real_generation = get_individual_from_history_by_uid(original_history,
+                                                                 original_uid)
+
+    child: Individual = new_history.individuals[0][0]
+    object.__setattr__(child, 'native_generation', gen_shift)
+    object.__setattr__(child, 'parent_operator', ParentOperator('mutation', [], [parent]))
+    child.parents.append(parent)
+    return original_history
+
+
 def _init_composer_history_for_case(history_id, task, metric, dataset_name, time,
-                                    external_history: Optional[Union[dict, os.PathLike]] = None):
+                                    external_history: Optional[Union[dict, os.PathLike]] = None,
+                                    initial_pipeline: Pipeline = None,
+                                    original_history: OptHistory = None,
+                                    modifed_generation_index=None,
+                                    original_uid=None,
+                                    is_golem_history=False):
     mock_dct = {}
 
     db_service = DBServiceSingleton()
     history_path = Path(f'{project_root()}/data/{history_id}/{history_id}_{task}.json')
 
     is_loaded_history = False
-    if external_history is None:
+    if external_history is None or not external_history:
         # run composer in real-time
-        history = run_composer(
-            task, metric, dataset_name, time, Path(project_root(), 'data', history_id, f'{history_id}_{task}.json')
-        )
-        history_obj = history.save()
+        history = run_composer(task, metric, dataset_name, time,
+                               Path(project_root(), 'data', history_id, f'{history_id}_{task}.json'),
+                               initial_pipeline=initial_pipeline)
+        history_obj = json.loads(history.save())
     elif isinstance(external_history, dict):
         # init from dict
         history_obj = external_history
@@ -106,12 +161,16 @@ def _init_composer_history_for_case(history_id, task, metric, dataset_name, time
     else:
         # load from path
         history_path = Path(external_history)
-        history = run_composer(task, metric, dataset_name, time, fitted_history_path=history_path)
+        history = run_composer(task, metric, dataset_name, time, history_path, initial_pipeline=initial_pipeline)
         history_obj = history.save()
         is_loaded_history = True
 
     if not is_loaded_history:
         _save_history_to_path(history, history_path)
+
+    if original_history:
+        history = merge_histories(original_history, history, modifed_generation_index, original_uid)
+        history_obj = history.save()
 
     if db_service.exists():
         if current_app and current_app.config['CONFIG_NAME'] == 'test':
@@ -130,30 +189,61 @@ def _init_composer_history_for_case(history_id, task, metric, dataset_name, time
 
     data = get_input_data(dataset_name=dataset_name, sample_type='train', task_type=task)
 
-    best_fitness = None
-
     global_id = 0
-    historical_pipelines = history.historical_pipelines
-    for pop_id in range(len(history.individuals)):
-        pop = history.individuals[pop_id]
-        for i, individual in enumerate(pop):
-            try:
+
+    case = db_service.try_find_one('cases', {'case_id': history_id})
+
+    if is_golem_history:
+        best_individual = None
+        max_fitness = -9999
+        for ind in history.final_choices:
+            ind: Individual
+            fitness = ind.fitness.values[0]  # sp_adj
+            if fitness > max_fitness:
+                max_fitness = fitness
+                best_individual = ind
+
+        if best_individual and case:
+            if case is not None:
+                case['individual_id'] = best_individual.uid
+                db_service.try_reinsert_one('cases', {'case_id': history_id}, case)
+
+        for pop_id in range(len(history.individuals)):
+            pop = history.individuals[pop_id]
+            for i, individual in enumerate(pop):
+                individual: Individual
+                is_existing_graph = is_pipeline_exists(individual.uid)
+                if not is_existing_graph:
+                    if db_service.exists():
+                        create_pipeline(uid=individual.uid, pipeline=individual, overwrite=True,
+                                        is_graph=is_golem_history)
+
+    if not is_golem_history:
+        adapter = PipelineAdapter()
+        historical_pipelines = [
+            PipelineTemplate(adapter.restore(ind))
+            for ind in itertools.chain(*history.individuals)
+        ]
+
+        final_choices = history.final_choices
+        if final_choices is None:
+            final_choices = history.individuals[-1]
+        individual = final_choices[0]
+        if case is not None:
+            case['individual_id'] = individual.uid
+            db_service.try_reinsert_one('cases', {'case_id': history_id}, case)
+
+        for pop_id in range(len(history.individuals)):
+            pop = history.individuals[pop_id]
+            for i, individual in enumerate(pop):
                 pipeline_template = historical_pipelines[global_id]
-                fitness = history.all_historical_fitness[i]
-                if best_fitness is None or fitness < best_fitness:
-                    best_fitness = fitness
-
-                    case = db_service.try_find_one('cases', {'case_id': history_id})
-                    if case is not None:
-                        case['individual_id'] = individual.uid
-                        db_service.try_reinsert_one('cases', {'case_id': history_id}, case)
-
                 is_existing_pipeline = is_pipeline_exists(individual.uid)
                 if not is_existing_pipeline:
-                    print(f'Pipeline №{i} with id{individual.uid} added')
+                    print(f'Pipeline №{i} with id {individual.uid} added')
                     pipeline = Pipeline()
                     pipeline_template.convert_to_pipeline(pipeline)
-                    pipeline.fit(data)
+                    if data is not None:
+                        pipeline.fit(data)
                     # workaround to reduce size
                     pipeline.preprocessor.structure_analysis = PipelineStructureExplorer()
                     if db_service.exists():
@@ -167,8 +257,6 @@ def _init_composer_history_for_case(history_id, task, metric, dataset_name, time
                             mock_dct['dicts_fitted_operations'].append(dict_fitted_operations)
                 if not is_pipeline_exists(individual.uid):
                     print(f'Critical error: pipeline for individual {individual.uid} not found after adding')
-            except Exception as ex:
-                print(f'Pipeline processing exception: {ex}')
-            global_id += 1
+                global_id += 1
 
     return mock_dct

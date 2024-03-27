@@ -2,7 +2,7 @@ from typing import List
 
 from fedot.core.repository.operation_types_repository import \
     OperationTypesRepository
-from fedot.core.repository.quality_metrics_repository import (
+from fedot.core.repository.metrics_repository import (
     ClassificationMetricsEnum, ClusteringMetricsEnum, RegressionMetricsEnum)
 from fedot.core.repository.tasks import TaskTypesEnum
 
@@ -22,8 +22,8 @@ _metrics_dict = {TaskTypesEnum.regression: RegressionMetricsEnum,
 
 
 def get_models_info(task_type: TaskTypesEnum) -> List[ModelInfo]:
-    model_names, _ = OperationTypesRepository().suitable_operation(task_type=task_type)
-    operation_names, _ = OperationTypesRepository(operation_type='data_operation'). \
+    model_names = OperationTypesRepository().suitable_operation(task_type=task_type)
+    operation_names = OperationTypesRepository(operation_type='data_operation'). \
         suitable_operation(task_type=task_type)
 
     models = [ModelInfo(name, name, 'model') for name in model_names]

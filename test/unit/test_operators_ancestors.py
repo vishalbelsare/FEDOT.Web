@@ -1,6 +1,6 @@
 import os
 
-from fedot.core.optimisers.opt_history import OptHistory
+from golem.core.optimisers.opt_history_objects.opt_history import OptHistory
 
 from app.api.composer.history_convert_utils import history_to_graph
 from utils import project_root
@@ -20,7 +20,7 @@ def test_correct_operator_ancestors_count(client):
             if operator_name == 'mutation':
                 test_status = len(sources) == 1
             elif operator_name == 'crossover':
-                test_status = len(sources) == 2
+                test_status = len(sources) == (2 if sources[0].startswith('ind') else 1)
             assert test_status, (
                 f'{operator_name} operators must have exactly '
                 f'{"one ancestor" if operator_name == "mutation" else "two ancestors"}: '

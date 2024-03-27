@@ -5,11 +5,9 @@ from flask_accepts import accepts, responds
 from flask_cors import cross_origin
 from flask_restx import Namespace, Resource
 
-from init.init_cases import add_case_to_db
-from init.init_history import _init_composer_history_for_case
-from .models import Metadata, ShowcaseItem
+from .models import ShowcaseItem
 from .schema import ShowcaseItemAddingSchema, ShowcaseItemSchema
-from .service import all_showcase_items_ids, showcase_full_item_by_uid
+from .service import all_showcase_items_ids, showcase_full_item_by_uid, create_new_case
 from .showcase_utils import showcase_item_from_db
 
 api = Namespace("Showcase", description="Operations with showcase")
@@ -33,7 +31,7 @@ class ShowCaseResource(Resource):
     @responds(schema=ShowcaseItemSchema, many=True)
     def get(self) -> List[ShowcaseItem]:
         """Get all available showcase items"""
-        showcase_items = [showcase_item_from_db(case_id) for case_id in all_showcase_items_ids()]
+        showcase_items = [showcase_item_from_db(case_id) for case_id in all_showcase_items_ids(with_custom=True)]
         return [item for item in showcase_items if item is not None]
 
 
@@ -55,26 +53,12 @@ class ShowCaseItemAddResource(Resource):
         if case_id in all_showcase_items_ids():
             return False
 
-        case = ShowcaseItem(
-            case_id=case_id,
-            title=case_id,
-            individual_id=None,
-            description=case_id,
-            icon_path='',
-            details={},
-            metadata=Metadata(task_name=case_meta_json['task'],
-                              metric_name=case_meta_json['metric_name'],
-                              dataset_name=case_meta_json['dataset_name']),
-        )
+        if case_meta_json['task'] == 'golem':
+            is_golem_history = True
+        else:
+            is_golem_history = False
 
-        add_case_to_db(case)
-
-        _init_composer_history_for_case(history_id=case_id,
-                                        task=case_meta_json['task'],
-                                        metric=case_meta_json['metric_name'],
-                                        dataset_name=case_meta_json['dataset_name'],
-                                        time=None,
-                                        external_history=opt_history_json)
+        create_new_case(case_id, case_meta_json, opt_history_json, is_golem_history=is_golem_history)
 
         return True
 

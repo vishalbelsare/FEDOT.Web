@@ -2,12 +2,12 @@ from copy import deepcopy
 from typing import Any, Dict
 
 import networkx as nx
-from fedot.core.optimisers.opt_history import OptHistory
+from golem.core.optimisers.opt_history_objects.opt_history import OptHistory
 from matplotlib import pyplot as plt
 
 
-def history_to_graph(history: OptHistory) -> Dict[str, Any]:
-    all_nodes = _create_operators_and_nodes(history)
+def history_to_graph(history: OptHistory, show_all: bool = False) -> Dict[str, Any]:
+    all_nodes = _create_operators_and_nodes(history, show_all)
 
     all_nodes, edges = _create_edges(all_nodes)
     all_nodes = _clear_tmp_fields(all_nodes)
@@ -61,16 +61,28 @@ def _process_operator(all_nodes, operator, individual, o_id, gen_id, prev_operat
     return all_nodes
 
 
-def _create_all_individuals_for_population(history, all_nodes, gen_id, order_id):
+def _create_all_individuals_for_population(history, all_nodes, gen_id, order_id, uids_to_show, show_all):
     for ind_id in range(len(history.individuals[gen_id])):
         individual = history.individuals[gen_id][ind_id]
+        if not show_all and (individual.uid not in uids_to_show or gen_id > uids_to_show[individual.uid]):
+            continue
 
         # add pipelines as node
         individual_id = individual.uid
         uid = f'ind_{gen_id}_{ind_id}'
         objs = {}
-        for metric in history._objective.metric_names:
-            objs[metric] = history.all_historical_fitness[order_id]
+        if hasattr(history, 'metric_names'):
+            metric_names = history.metric_names
+        else:
+            metrics_num = len(history.individuals[0][0].fitness.values)
+            metric_names = [f'metric_{n}' for n in range(metrics_num)]
+
+        for metric in metric_names:
+            if isinstance(history.all_historical_fitness[0], list):
+                objs[metric] = history.all_historical_fitness[metric_names.index(metric)][order_id]
+            else:
+                objs[metric] = history.all_historical_fitness[order_id]
+
         pipeline_node = _init_pipeline_dict(individual, objs, uid, individual_id, gen_id, ind_id)
         all_nodes.append(pipeline_node)
         order_id += 1
@@ -78,45 +90,75 @@ def _create_all_individuals_for_population(history, all_nodes, gen_id, order_id)
     return all_nodes, order_id
 
 
-def _create_operators_and_nodes(history):
+def _create_operators_and_nodes(history, show_all):
     all_nodes = []
     current_order_id = 0
-    for gen_id in range(len(history.individuals)):
+    if hasattr(history, 'final_choices') and history.final_choices:
+        final_choices = history.final_choices
+    elif len(history.archive_history[-1]) == 1:
+        final_choices = history.archive_history[-1]
+    else:
+        final_choices = [max(history.archive_history[-1], key=lambda ind: ind.fitness)]
+
+    for ind in final_choices:
+        if ind.native_generation is None:
+            ind.set_native_generation(len(history.individuals) - 1)
+
+    uid_to_last_generation_map = {ind.uid: len(history.individuals) for ind in final_choices}
+    current_inds = final_choices
+    for iteration in range(10_000):
+        next_inds = []
+        for ind in current_inds:
+            if not ind.parents:
+                continue
+            for parent in ind.parents_from_prev_generation:
+                next_inds.append(parent)
+                gen_id = max(uid_to_last_generation_map.get(parent.uid, 0), ind.native_generation - 1)
+                uid_to_last_generation_map[parent.uid] = gen_id
+        current_inds = next_inds
+
+    for gen_id, generation in enumerate(history.individuals):
         o_id = 0
         all_nodes, current_order_id = _create_all_individuals_for_population(history, all_nodes, gen_id,
-                                                                             current_order_id)
+                                                                             current_order_id,
+                                                                             uid_to_last_generation_map, show_all)
         if gen_id == 0:
             continue
-        for ind_id in range(len(history.individuals[gen_id])):
-            individual = history.individuals[gen_id][ind_id]
+        for ind_id, individual in enumerate(generation):
+            if individual.native_generation != gen_id:
+                continue
+            if not show_all and (individual.uid not in uid_to_last_generation_map or
+                                 gen_id > uid_to_last_generation_map[individual.uid]):
+                continue
 
             # add evo operators as nodes
-            parent_operators_for_ind = history.individuals[gen_id][ind_id].parent_operators
-            parent_operators_for_ind = parent_operators_for_ind if isinstance(parent_operators_for_ind, list) \
-                else [parent_operators_for_ind]
-
+            parent_operators_for_ind = individual.operators_from_prev_generation
             for o_num, operator in enumerate(parent_operators_for_ind):
-                if isinstance(operator, list) and len(operator) == 0:
+                if not operator.parent_individuals:
                     continue
-                prev_operator = None
-                if operator.operator_type != 'selection':
-                    # connect with previous operator (e.g. crossover -> mutation)
-                    skip_next = False
-                    if len(parent_operators_for_ind) > 1:
-                        # in several operator in a row
-                        if o_num > 0:
-                            prev_operator = parent_operators_for_ind[o_num - 1]
-                        if o_num < len(parent_operators_for_ind) - 1:
-                            skip_next = True
 
-                    all_nodes = _process_operator(all_nodes, operator, individual, o_id, gen_id,
-                                                  prev_operator, skip_next)
-                    o_id += 1
+                prev_operator = None
+                if operator.type_ == 'selection':
+                    continue
+                # connect with previous operator (e.g. crossover -> mutation)
+                skip_next = False
+                # in several operator in a row
+                if o_num > 0:
+                    prev_operator = parent_operators_for_ind[o_num - 1]
+                if o_num < len(parent_operators_for_ind) - 1:
+                    skip_next = True
+
+                all_nodes = _process_operator(all_nodes, operator, individual, o_id, gen_id,
+                                              prev_operator, skip_next)
+                o_id += 1
     return all_nodes
 
 
 def _create_edges(all_nodes):
     edges = []
+    last_gen_id = all_nodes[-1]['gen_id']
+    last_unlinked_nodes = []
+
     for i, node in enumerate(all_nodes):
         # connect individuals
         if node['type'] == 'individual':
@@ -128,6 +170,8 @@ def _create_edges(all_nodes):
 
                 if parent_ind is not None:
                     edges = _add_edge(edges, parent_ind['uid'], node['uid'])
+                elif node['gen_id'] == last_gen_id:
+                    last_unlinked_nodes.append(node)
 
         elif node['type'] == 'evo_operator':
             # from pipeline to operator
@@ -155,6 +199,19 @@ def _create_edges(all_nodes):
             if next_individual is not None:
                 edges = _add_edge(edges, operator_node['uid'], next_individual['uid'])
 
+    unlinked_nodes_individual_ids = [n['individual_id'] for n in last_unlinked_nodes]
+    unlinked_nodes_uids = [n['uid'] for n in last_unlinked_nodes]
+
+    for node in reversed(all_nodes):
+        if node['type'] == 'individual':
+            if node['gen_id'] == last_gen_id:
+                continue
+            if node['individual_id'] in unlinked_nodes_individual_ids:
+                index = unlinked_nodes_individual_ids.index(node['individual_id'])
+                edges = _add_edge(edges, node['uid'], unlinked_nodes_uids[index])
+                del unlinked_nodes_individual_ids[index]
+                del unlinked_nodes_uids[index]
+
     return all_nodes, edges
 
 
@@ -168,7 +225,7 @@ def _add_edge(edges, source, target):
 
 
 def _init_operator_dict(ind, operator, o_id, gen_id):
-    operator_id = f'evo_operator_{gen_id}_{o_id}_{operator.operator_type}'
+    operator_id = f'evo_operator_{gen_id}_{o_id}_{operator.type_}'
     operator_node = dict()
     operator_node['tmp_operator_uid'] = operator.uid
     operator_node['uid'] = operator_id
@@ -176,8 +233,8 @@ def _init_operator_dict(ind, operator, o_id, gen_id):
     operator_node['next_gen_id'] = gen_id
     operator_node['operator_id'] = o_id
     operator_node['type'] = 'evo_operator'
-    operator_node['name'] = operator.operator_type
-    operator_node['full_name'] = operator.operator_name
+    operator_node['name'] = operator.type_
+    operator_node['full_name'] = ', '.join(map(str, operator.operators))
 
     # temporary fields
     try:

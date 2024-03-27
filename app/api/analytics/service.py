@@ -1,8 +1,9 @@
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from golem.core.dag.linked_graph import get_distance_between
 from fedot.core.data.data import InputData, OutputData
-from fedot.core.optimisers.adapters import PipelineAdapter
+from fedot.core.pipelines.adapters import PipelineAdapter
 from fedot.core.pipelines.pipeline import Pipeline
 
 from app.api.composer.service import composer_history_for_case
@@ -115,7 +116,7 @@ def get_population_analytics(case_id: str, analytic_type: str) -> BoxPlotData:
             for individual in generation:
                 pipeline = adapter.restore(individual.graph)
                 gen_distances += [
-                    pipeline.operator.distance_to(init_pipeline)
+                    get_distance_between(pipeline, init_pipeline)
                     for init_pipeline in init_population
                 ]
             y_gen.append(gen_distances)
@@ -144,9 +145,11 @@ def get_prediction_for_pipeline(
             dataset_name=case.metadata.dataset_name, sample_type='train',
             task_type=case.metadata.task_name
         )
-        if not pipeline.is_fitted and train_data:
-            pipeline.fit(train_data)
-        prediction = pipeline.predict(test_data)
+        if hasattr(pipeline, 'is_fitted'):
+            if not pipeline.is_fitted and train_data:
+                pipeline.fit(train_data)
+            if test_data:
+                prediction = pipeline.predict(test_data)
     return test_data, prediction
 
 

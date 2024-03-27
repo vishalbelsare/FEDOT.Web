@@ -3,12 +3,14 @@ import warnings
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 import pymongo
 from bson import json_util
 from fedot.core.pipelines.pipeline import Pipeline
-from fedot.core.pipelines.validation import validate
+from fedot.core.pipelines.verification import verify_pipeline as verify
 from flask import current_app, has_app_context, url_for
+from golem.core.optimisers.opt_history_objects.individual import Individual
 from pymongo.errors import DuplicateKeyError
 
 from app.singletons.db_service import DBServiceSingleton
@@ -16,56 +18,74 @@ from utils import project_root
 
 
 def is_pipeline_exists(uid: str) -> bool:
-    return DBServiceSingleton().try_find_one('pipelines', {'_id': str(uid)}) is not None
+    return DBServiceSingleton().try_find_one('pipelines', {'individual_id': uid}) is not None
 
 
 def pipeline_by_uid(uid: str) -> Optional[Pipeline]:
     db_service = DBServiceSingleton()
     pipeline = Pipeline()
-    pipeline_dict: Optional[Dict[str, Any]] = db_service.try_find_one('pipelines', {'_id': str(uid)})
+    pipeline_dict: Optional[Dict[str, Any]] = db_service.try_find_one('pipelines', {'individual_id': uid})
     if pipeline_dict is None:
         return None
 
     dict_fitted_operations: Optional[Dict[str, Any]] = None
     if current_app.config['CONFIG_NAME'] == 'test':
-        dict_fitted_operations = db_service.try_find_one('dict_fitted_operations', {'_id': uid})
+        dict_fitted_operations = db_service.try_find_one('dict_fitted_operations', {'individual_id': uid})
     else:
         file = db_service.try_find_one_file({'filename': str(uid), 'type': 'dict_fitted_operations'})
         if file is not None:
             dict_fitted_operations = json_util.loads(file.read())
 
     if dict_fitted_operations:
-        for key in dict_fitted_operations:
-            if key.find('operation') != -1:
-                bytes_container = BytesIO()
-                bytes_container.write(dict_fitted_operations[key])
-                dict_fitted_operations[key] = bytes_container
+        dict_fitted_operations = {key: BytesIO(operation) for key, operation in dict_fitted_operations.items()
+                                  if key not in ['individual_id', '_id']}
     pipeline.load(pipeline_dict, dict_fitted_operations)
     return pipeline
 
 
-def validate_pipeline(pipeline: Pipeline) -> Tuple[bool, str]:
+def graph_by_uid(uid: str) -> Optional[Individual]:
+    db_service = DBServiceSingleton()
+
+    individual_dict: Optional[Dict[str, Any]] = db_service.try_find_one('pipelines', {'individual_id': uid})
+    if individual_dict:
+        del individual_dict['_id']
+        graph_individual = Individual.load(json.dumps(individual_dict))
+
+        return graph_individual
+
+
+def verify_pipeline(pipeline: Pipeline) -> Tuple[bool, str]:
     try:
-        validate(pipeline)
+        verify(pipeline)
         return True, 'Correct pipeline'
     except ValueError as ex:
         return False, str(ex)
 
 
-def create_pipeline(uid: str, pipeline: Pipeline, overwrite: bool = False) -> Tuple[str, bool]:
+def create_pipeline(uid: str, pipeline: Pipeline, overwrite: bool = False, is_new_pipelene: bool = False,
+                    is_graph: bool = False) -> Tuple[
+    str, bool]:
     is_new = True
     existing_uid = is_pipeline_exists(uid)
     if existing_uid and not overwrite:
         is_new = False
 
-    dumped_json, dict_fitted_operations = pipeline.save()
+    dict_fitted_operations = None
+    if is_graph:
+        dumped_json = pipeline.save()
+    else:
+        dumped_json, dict_fitted_operations = pipeline.save()
     if dict_fitted_operations:
         for key in dict_fitted_operations:
             if key.find('operation') != -1 or key == 'preprocessing':
                 dict_fitted_operations[key].seek(0)
                 saved_operation = dict_fitted_operations[key].read()
                 dict_fitted_operations[key] = saved_operation
-        dict_fitted_operations['_id'] = str(uid)
+        dict_fitted_operations['individual_id'] = str(uid)
+
+    if is_new_pipelene:
+        is_new = True
+        uid = str(uuid4())
 
     if is_new:
         dict_pipeline = json.loads(dumped_json)
@@ -77,23 +97,18 @@ def create_pipeline(uid: str, pipeline: Pipeline, overwrite: bool = False) -> Tu
 
 
 def _add_pipeline_to_db(
-    uid: str, dict_pipeline: Dict, dict_fitted_operations: Dict,
-    init_db: bool = False, overwrite: bool = False
+        uid: str, dict_pipeline: Dict, dict_fitted_operations: Dict,
+        init_db: bool = False, overwrite: bool = False
 ) -> Optional[List[Dict]]:
-    dict_pipeline['_id'] = str(uid)
+    uid = uid
+    dict_pipeline['individual_id'] = uid
     db_service = DBServiceSingleton()
-    # if init_db:
-    #     db_service.try_delete_one('pipelines', {'_id': str(uid)})
-    # else:
-    #     is_exists = is_pipeline_exists(uid)
-    #     if is_exists or overwrite:
-    #         db_service.try_delete_one('pipelines', {'_id': str(uid)})
-    db_service.try_reinsert_one('pipelines', {'_id': str(uid)}, dict_pipeline)
+    db_service.try_reinsert_one('pipelines', {'individual_id': uid}, dict_pipeline)
 
     if dict_fitted_operations is not None:
         try:
             if has_app_context() and current_app.config['CONFIG_NAME'] == 'test':
-                dict_fitted_operations = db_service.try_find_one('dict_fitted_operations', {'_id': uid})
+                dict_fitted_operations = db_service.try_find_one('dict_fitted_operations', {'individual_id': uid})
             else:
                 db_service.try_reinsert_file(
                     {'filename': uid, 'type': 'dict_fitted_operations'}, dict_fitted_operations
@@ -113,6 +128,9 @@ def get_image_url(filename: str, pipeline: Optional[Pipeline]) -> str:
     image_path = f'{project_root()}/frontend/build/static/generated_images/{filename}'
     image = Path(image_path)
     if not image.exists():
+
+        print('filename', filename)
+        print('pipeline', pipeline)
         dir_path = Path(f'{project_root()}/frontend/build/static/generated_images/')
         if not dir_path.exists():
             dir_path.mkdir()
